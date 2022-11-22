@@ -16,12 +16,12 @@ CREATE TABLE acct_v9 (
     ip_dst inet NOT NULL DEFAULT '0.0.0.0',
     port_src INT NOT NULL DEFAULT 0,
     port_dst INT NOT NULL DEFAULT 0,
+    ip_proto SMALLINT NOT NULL DEFAULT 0,
     post_nat_ip_src inet NOT NULL DEFAULT '0.0.0.0',
     post_nat_ip_dst inet NOT NULL DEFAULT '0.0.0.0',
     post_nat_port_src INT(2) UNSIGNED NOT NULL,
     post_nat_port_dst INT(2) UNSIGNED NOT NULL,
     nat_event INT(1) UNSIGNED NOT NULL,
-    ip_proto SMALLINT NOT NULL DEFAULT 0,
     tos INT NOT NULL DEFAULT 0,
     packets INT NOT NULL,
     bytes BIGINT NOT NULL,
@@ -29,9 +29,10 @@ CREATE TABLE acct_v9 (
     stamp_inserted timestamp without time zone NOT NULL DEFAULT '0001-01-01 00:00:00',
     stamp_updated timestamp without time zone,
     CONSTRAINT acct_v9_pk PRIMARY KEY (
-      tag, class_id, ip_src, ip_dst, port_src, port_dst, ip_proto, stamp_inserted
+      tag, ip_src, ip_dst, port_src, port_dst, ip_proto, stamp_inserted
     )
 );
+SELECT create_hypertable('acct_v9', 'stamp_inserted', chunk_time_interval => INTERVAL '1 hour');
 
 DROP TABLE IF EXISTS proto;
 CREATE TABLE proto (
