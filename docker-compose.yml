@@ -1,0 +1,29 @@
+version: "3.9"
+services:
+  db:
+    image: timescale/timescaledb:latest-pg14
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      - TS_TUNE_MEMORY=8GB
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+  pgadmin:
+    # https://www.pgadmin.org/docs/pgadmin4/development/container_deployment.html
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    ports:
+      - 8080:8080
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=${PGADMIN_DEFAULT_EMAIL}
+      - PGADMIN_LISTEN_PORT=${PGADMIN_LISTEN_PORT}
+      - PGADMIN_DEFAULT_PASSWORD=${PGADMIN_DEFAULT_PASSWORD}
+    depends_on:
+      - db
+  collector:
+    image: pmacct/nfacctd:v1.7.5
+    restart: unless-stopped
+    ports:
+      - "2055:2055/udp"
+    volumes:
+      - ./nfacctd.conf:/etc/pmacct/nfacctd.conf
