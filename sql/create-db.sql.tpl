@@ -1,43 +1,47 @@
 
 -- Database
-DROP DATABASE pmacct;
 CREATE DATABASE pmacct;
+\c pmacct
 
 -- User
 CREATE USER pmacct;
 ALTER USER pmacct WITH PASSWORD '$POSTGRES_PMACCT_PW';
 
--- Tables 
-DROP TABLE IF EXISTS acct_v9;
+-- Tables
 CREATE TABLE acct_v9 (
-    tag BIGINT NOT NULL DEFAULT 0,
-    class_id CHAR(16) NOT NULL DEFAULT ' ',
-    ip_src inet NOT NULL DEFAULT '0.0.0.0',
-    ip_dst inet NOT NULL DEFAULT '0.0.0.0',
-    port_src INT NOT NULL DEFAULT 0,
-    port_dst INT NOT NULL DEFAULT 0,
-    ip_proto SMALLINT NOT NULL DEFAULT 0,
-    post_nat_ip_src inet NOT NULL DEFAULT '0.0.0.0',
-    post_nat_ip_dst inet NOT NULL DEFAULT '0.0.0.0',
-    post_nat_port_src INT(2) UNSIGNED NOT NULL,
-    post_nat_port_dst INT(2) UNSIGNED NOT NULL,
-    nat_event INT(1) UNSIGNED NOT NULL,
-    tos INT NOT NULL DEFAULT 0,
-    packets INT NOT NULL,
-    bytes BIGINT NOT NULL,
-    flows INT NOT NULL DEFAULT 0,
-    stamp_inserted timestamp without time zone NOT NULL DEFAULT '0001-01-01 00:00:00',
-    stamp_updated timestamp without time zone,
+    tag               BIGINT NOT NULL DEFAULT 0,
+    class_id          CHAR(16) NOT NULL DEFAULT ' ',
+    ip_src            inet NOT NULL DEFAULT '0.0.0.0',
+    ip_dst            inet NOT NULL DEFAULT '0.0.0.0',
+    port_src          INT NOT NULL DEFAULT 0,
+    port_dst          INT NOT NULL DEFAULT 0,
+    ip_proto          SMALLINT NOT NULL DEFAULT 0,
+    post_nat_ip_src   inet NOT NULL DEFAULT '0.0.0.0',
+    post_nat_ip_dst   inet NOT NULL DEFAULT '0.0.0.0',
+    post_nat_port_src INT NOT NULL DEFAULT 0,
+    post_nat_port_dst INT NOT NULL DEFAULT 0,
+    nat_event         INT NOT NULL DEFAULT -1,
+    tos               INT NOT NULL DEFAULT 0,
+    packets           INT NOT NULL,
+    bytes             BIGINT NOT NULL,
+    flows             INT NOT NULL DEFAULT 0,
+    stamp_inserted    timestamp without time zone NOT NULL DEFAULT '0001-01-01 00:00:00',
+    stamp_updated     timestamp without time zone,
+    
     CONSTRAINT acct_v9_pk PRIMARY KEY (
       tag, ip_src, ip_dst, port_src, port_dst, ip_proto, stamp_inserted
     )
 );
-SELECT create_hypertable('acct_v9', 'stamp_inserted', chunk_time_interval => INTERVAL '1 hour');
+SELECT create_hypertable(
+  'acct_v9',
+  'stamp_inserted',
+  chunk_time_interval => INTERVAL '1 hour'
+);
 
-DROP TABLE IF EXISTS proto;
 CREATE TABLE proto (
-    num SMALLINT NOT NULL,
-    description CHAR(20),
+    num          SMALLINT NOT NULL,
+    description  CHAR(20),
+
     CONSTRAINT proto_pk PRIMARY KEY (num)
 );
 
