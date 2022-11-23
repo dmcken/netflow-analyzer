@@ -1,0 +1,8 @@
+-- Wipe the database
+DROP ROLE pmacct;
+DROP USER IF EXISTS pmacct;
+DROP TABLE IF EXISTS acct_v9;
+DROP TABLE IF EXISTS proto;
+DROP DATABASE IF EXISTS pmacct;
+
+
