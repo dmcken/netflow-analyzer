@@ -2,13 +2,13 @@
 !
 !
 !
-daemonize: true
+daemonize: false
 pidfile: /var/run/nfacctd.pid
-syslog: daemon
+! syslog: daemon
 !
 nfacctd_port: 2055
 !
-aggregate: src_host,dst_host,post_nat_ip_src,post_nat_ip_dst,src_port,post_nat_port_src,post_nat_port_dst,dst_port,proto,tos,nat_event
+aggregate: src_host,src_port,dst_host,dst_port,proto,tos,post_nat_src_host,post_nat_src_port,post_nat_dst_host,post_nat_dst_port,nat_event
 ! interested in in and outbound traffic
 !aggregate: src_host,dst_host
 ! on this network
