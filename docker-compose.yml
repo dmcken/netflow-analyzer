@@ -7,6 +7,9 @@ services:
     environment:
       - TS_TUNE_MEMORY=8GB
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
   pgadmin:
     # https://www.pgadmin.org/docs/pgadmin4/development/container_deployment.html
     image: dpage/pgadmin4:latest
