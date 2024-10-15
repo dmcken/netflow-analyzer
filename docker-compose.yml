@@ -15,7 +15,7 @@ services:
     image: dpage/pgadmin4:latest
     restart: unless-stopped
     ports:
-      - 8080:8080
+      - 5050:5050
     environment:
       - PGADMIN_DEFAULT_EMAIL=${PGADMIN_DEFAULT_EMAIL}
       - PGADMIN_LISTEN_PORT=${PGADMIN_LISTEN_PORT}
