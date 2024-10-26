@@ -30,3 +30,22 @@ A complete netflow analysis setup, based on the following:
    ```
    You are looking for a line that says <code>database system is ready to accept connections</code>, if present then you are good to continue, otherwise the database needs to be troubleshooted.
 7. 
+
+
+
+### Notes:
+* TimescaleDB:
+   * IP address column type
+   * Compress data after a certain point
+   * Build schema and loading script
+   * pgAdmin for management of backend
+   * Report builder options
+* Kafka for queue:
+   * How well would this work against RabbitMQ?
+   * It still writes data to disk... Optane?
+   * Protobuf for faster parsing
+   * Possibly remove this layer entirely if use pmacct instead of goflow2
+   * Trigger script for enriching with external data sources
+   * Can use this to deal with creating aggregates
+* Mikrotik:
+   * v9 / IPFIX does not work with goflow2
