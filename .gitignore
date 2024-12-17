@@ -2,3 +2,6 @@
 .env
 nfacctd.conf
 sql/create-db.sql
+
+# Docker volumes
+pgdata/
