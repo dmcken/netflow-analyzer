@@ -1,0 +1,73 @@
+formatter:
+  fields: # list of fields to format in JSON
+    - type
+    - time_received_ns
+    - sequence_num
+    - sampling_rate
+    - flow_direction
+    - sampler_address
+    - time_flow_start_ns
+    - time_flow_end_ns
+    - bytes
+    - packets
+    - src_addr
+    - src_net
+    - dst_addr
+    - dst_net
+    - etype
+    - proto
+    - src_port
+    - dst_port
+    - in_if
+    - out_if
+    - src_mac
+    - dst_mac
+    # additional fields
+    - icmp_name # virtual column
+    - csum # udp checksum
+    - post_nat_src_ipv4_address
+    - post_nat_dst_ipv4_address
+    - post_napt_src_transport_port
+    - post_napt_dst_transport_port
+  key:
+    - sampler_address
+  protobuf: # manual protobuf fields addition
+    - name: flow_direction
+      index: 42
+      type: varint
+    - name: bi_flow_direction
+      index: 41
+      type: varint
+    - name: ingress_vrf_id
+      index: 39
+      type: varint
+    - name: egress_vrf_id
+      index: 40
+      type: varint
+    - name: csum
+      index: 999
+      type: varint
+    - name: post_nat_src_ipv4_address
+      index: 2225
+      type: string
+    - name: post_nat_dst_ipv4_address
+      index: 2226
+      type: string
+    - name: post_napt_src_transport_port
+      index: 2227
+      type: varint
+    - name: post_napt_dst_transport_port
+      index: 2228
+      type: varint
+  render:
+    time_received_ns: datetimenano
+ipfix:
+  mapping:
+    - field: 225
+      destination: post_nat_src_ipv4_address
+    - field: 226
+      destination: post_nat_dst_ipv4_address
+    - field: 227
+      destination: post_napt_src_transport_port
+    - field: 228
+      destination: post_napt_dst_transport_port
