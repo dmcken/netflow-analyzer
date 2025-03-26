@@ -5,3 +5,7 @@ sql/create-db.sql
 
 # Docker volumes
 pgdata/
+
+
+# Rust output
+goflow2/archiver/target/
