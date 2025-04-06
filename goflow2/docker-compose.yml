@@ -7,13 +7,19 @@ services:
     user: root # because docker-compose mount as root
     ports:
       - '8080:8080'
-      # - '6343:6343/udp'
+      - '6343:6343/udp'
       - '2055:2055/udp'
     command:
-      - -mapping=/field-map.yaml
-      - -transport=file
-      - -transport.file=/var/log/goflow/goflow2.log
-      - -format=json
+      # - -mapping=/field-map.yaml
+      # Direct files
+      # - -transport=file
+      # - -transport.file=/var/log/goflow/goflow2.log
+      # - -format=json
+      # Kafka
+      - -transport.kafka.brokers=broker:9092
+      - -transport=kafka
+      - -transport.kafka.topic=flows
+      - -format=bin
     restart: unless-stopped
     #logging:
     #  driver: gelf
@@ -23,21 +29,28 @@ services:
     volumes:
       - ./logs:/var/log/goflow
       - ./field-map.yaml:/field-map.yaml
+    depends_on:
+      - broker
   broker:
     container_name: broker
-    environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://localhost:9092,CONTROLLER://localhost:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_NUM_PARTITIONS: 3
+    # environment:
+    #   - ALLOW_PLAINTEXT_LISTENER=yes
+    #   - KAFKA_DELETE_TOPIC_ENABLE=true
+    #   - KAFKA_ENABLE_KRAFT=true
+    #   - KAFKA_KRAFT_CLUSTER_ID=AAAAAAAAAAAAAAAAAAAAAA # uuid encoded in base64
+    #   # dd if=/dev/zero of=/dev/stdout count=16 bs=1 | openssl enc -A -a
+    #   # head -c 20 /dev/zero | base64
+    #   - KAFKA_CFG_BROKER_ID=1
+    #   - KAFKA_CFG_NODE_ID=1
+    #   - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+    #   - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+    #   - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=IB
+    #   - KAFKA_CFG_PROCESS_ROLES=broker,controller
+    #   - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,BROKER:PLAINTEXT,IB:PLAINTEXT
+    #   - KAFKA_CFG_LISTENERS=CONTROLLER://:9093,BROKER://:9092,IB://:9094
+    #   - KAFKA_ADVERTISED_LISTENERS=BROKER://kafka:9092,IB://:9094
+    #   - BITNAMI_DEBUG=yes
+    restart: unless-stopped
     image: apache/kafka:4.0.0
     ports:
       - 9092:9092
