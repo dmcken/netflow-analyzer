@@ -8,7 +8,7 @@
 ## Crontab installation
 
 ```
-*/30 * * * * /home/<user>/goflow2-mine/cycle_log.sh >> /home/<user>/goflow2-mine/cycle_log.log 2>&1
+*/30 * * * * /home/<user>/netflow-analyzer/goflow2/simple-archiver/cycle_log.sh >> /home/<user>/netflow-analyzer/goflow2/simple-archiver/cycle_log.log 2>&1
 ```
 
 
