@@ -1,5 +1,7 @@
 
+# System imports
 import subprocess
+import sys
 
 
 def testBit(int_type, offset):
@@ -49,7 +51,7 @@ def extract_record(data: bytes, start_offset: int, separator: str=None) -> (byte
     return (data[block_start:block_end], final_offset)
 
 def main() -> None:
-    f = open('goflow2-single.log','rb')
+    f = open(sys.argv[1],'rb')
     contents = f.read()
     f.close()
 
