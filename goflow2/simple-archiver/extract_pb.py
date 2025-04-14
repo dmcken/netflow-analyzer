@@ -75,6 +75,9 @@ def main() -> None:
         output = protoscope_output.communicate()[0].decode('utf-8')
         print(f"Record: {offset:04x} => {hex_str}\n{output}")
 
+        with open('rec.proto','wb') as f:
+            f.write(record_data)
+
     return
 
 if __name__ == '__main__':
