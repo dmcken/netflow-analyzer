@@ -29,7 +29,32 @@ A complete netflow analysis setup, requirements as follows:
 
 At the moment, I'm at least experimenting with two major solutions:
 1. goflow2
-    * Newer solution written in Go
+    * Newer solution written in Go.
+    * Only writes to files and apache kafka.
 2. pmacct
-    * Older solution written in C
-    * Can speak directly to some databases
+    * Older solution written in C.
+    * Can speak directly to some of the backend databases being investigated.
+
+
+
+## Notes / Questions
+
+* Which database is best for this use case?
+    * Criteria:
+        * Time-series storage / tiering
+            * Partitions (by day, hour or possibly minutes)
+            * Shifting of older partitions to slower storage.
+        * Conditional backup and restoration
+            * Binary format highly preferred
+            * To restore a parition covering a specific timeframe loading other surrounding partitions.
+    * Options:
+        * Postgres:
+            * [+] Has native IP address types.
+            * [-] Doesn't support unsigned integer types (TCP/UDP ports are unsigned 16-bit so thus requires the 32-bit signed INTEGER type).
+        * Clickhouse:
+        * Custom:
+            * Direct storage in avro, protobuf, etc.
+* With goflow2 and custom fields mapped how do I generate the updated protobuf file?
+* Done
+
+
