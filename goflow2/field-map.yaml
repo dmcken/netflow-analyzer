@@ -20,8 +20,8 @@ formatter:
     - dst_port
     - in_if
     - out_if
-    - src_mac
-    - dst_mac
+    # - src_mac
+    # - dst_mac
     # additional fields
     - icmp_name # virtual column
     - csum # udp checksum
