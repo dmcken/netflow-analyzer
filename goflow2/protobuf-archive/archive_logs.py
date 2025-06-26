@@ -60,6 +60,8 @@ def main() -> None:
 
     # End - params
 
+    # Ensure we are in the correct folder
+    # Required for docker compose
     os.chdir(dir_base)
 
     # Set permissions on current files within container
