@@ -10,6 +10,33 @@ import subprocess
 # Globals
 logger = logging.getLogger(__name__)
 
+def parse_filename(curr_file: str) -> tuple(str):
+    """Parse file name to extract metadata.
+
+    Args:
+        curr_file (str): File to parse data from.
+
+    Returns:
+        tuple(str): Tuple holding the values parsed.
+    """
+
+    res = re.match(
+        'goflow2_([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2}).([A-Za-z0-9\.]*)',
+        curr_file,
+    )
+    if not res:
+        logger.error(f"Invalid file name: {curr_file}")
+        continue
+
+    year    = res.group(1)
+    month   = res.group(2)
+    day     = res.group(3)
+    hour    = res.group(4)
+    minute  = res.group(5)
+    f_ext   = res.group(6)
+
+    return (year, month, day, hour, minute, f_ext)
+
 
 def main() -> None:
     '''Main function'''
@@ -26,6 +53,10 @@ def main() -> None:
     # and 99/100 scenarios will use the current user
     file_uid = 1000
     file_gid = 1000
+
+    compress_bin = 'xz'
+    compress_ext = 'xz'
+    compress_params = ['-9','-e']
 
     # End - params
 
@@ -50,21 +81,7 @@ def main() -> None:
     for curr_file in log_files:
         logger.info(f"Processing: {curr_file}")
 
-        res = re.match(
-                'goflow2_([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2}).([A-Za-z0-9\.]*)',
-            curr_file,
-        )
-        if not res:
-            logger.error(f"Invalid filr name: {curr_file}")
-            continue
-
-        year    = res.group(1)
-        month   = res.group(2)
-        day     = res.group(3)
-        hour    = res.group(4)
-        minute  = res.group(5)
-        f_ext   = res.group(6)
-
+        year, month, day, hour, minute, f_ext = parse_filename(curr_file)
         logger.debug(f"{year} # {month} # {day} # {hour} # {minute} # {f_ext}")
 
         final_path = f"{dir_archive}/{year}/{month}/{day}"
@@ -75,9 +92,9 @@ def main() -> None:
 
         if f_ext == 'log':
             logger.info(f"Compressing: {curr_file}")
-            subprocess.run(['bzip2','-9',f'logs/{curr_file}'])
-            curr_file += '.bz2'
-            f_ext += '.bz2'
+            subprocess.run([compress_bin,'-9','-e',f'logs/{curr_file}'])
+            curr_file += f'.{compress_ext}'
+            f_ext     += f'.{compress_ext}'
 
         logger.info(f"Moving {curr_file} to {final_path}")
         shutil.move(f"logs/{curr_file}", f"{final_path}/{curr_file}")
