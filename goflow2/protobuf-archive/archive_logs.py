@@ -47,7 +47,7 @@ def main() -> None:
     dir_archive = '/mnt/archive-disk/netflow-logs'
     dir_rel_logs = 'logs/'
 
-    log_file_regex = 'goflow2_[0-9]+_[0-9]+.log'
+    log_file_regex = 'goflow2_[0-9]*_[0-9]*.log'
 
     # These can possibly be read from the current environment as this script
     # and 99/100 scenarios will use the current user
