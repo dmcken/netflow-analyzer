@@ -63,6 +63,12 @@ def main() -> None:
     os.chdir(dir_base)
 
     # Set permissions on current files within container
+    # Set permissions on base folder
+    result = subprocess.run([
+        'docker','compose','exec','goflow2','sh','-c',
+        f'chown {file_uid}:{file_gid} /var/log/goflow/',
+    ], capture_output=True)
+    # Set permissions on log files we are about to archive
     result = subprocess.run([
         'docker','compose','exec','goflow2','sh','-c',
         f'chown {file_uid}:{file_gid} /var/log/goflow/{log_file_regex}',
