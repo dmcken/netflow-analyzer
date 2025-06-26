@@ -25,8 +25,8 @@ def parse_filename(curr_file: str) -> tuple(str):
         curr_file,
     )
     if not res:
-        logger.error(f"Invalid file name: {curr_file}")
-        continue
+        raise RuntimeError(f"Invalid file name")
+
 
     year    = res.group(1)
     month   = res.group(2)
@@ -79,30 +79,33 @@ def main() -> None:
     logger.debug(f"File list:\n{pprint.pformat(log_files)}")
 
     for curr_file in log_files:
-        logger.info(f"Processing: {curr_file}")
+        try:
+            logger.info(f"Processing: {curr_file}")
 
-        year, month, day, hour, minute, f_ext = parse_filename(curr_file)
-        logger.debug(f"File meta: {year} # {month} # {day} # {hour} # {minute} # {f_ext}")
+            year, month, day, hour, minute, f_ext = parse_filename(curr_file)
+            logger.debug(f"File meta: {year} # {month} # {day} # {hour} # {minute} # {f_ext}")
 
-        final_path = f"{dir_archive}/{year}/{month}/{day}"
-        logger.debug(f"Dst path: {final_path}")
+            final_path = f"{dir_archive}/{year}/{month}/{day}"
+            logger.debug(f"Dst path: {final_path}")
 
-        # Create dst path if it doesn't exist
-        os.makedirs(final_path, exist_ok=True)
+            # Create dst path if it doesn't exist
+            os.makedirs(final_path, exist_ok=True)
 
-        if f_ext == 'log':
-            logger.info(f"Compressing: {curr_file}")
-            subprocess.run([
-                compress_bin,
-                *compress_params,
-                f'logs/{curr_file}'
-            ])
-            # Update the current file extension
-            curr_file += f'.{compress_ext}'
-            f_ext     += f'.{compress_ext}'
+            if f_ext == 'log':
+                logger.info(f"Compressing: {curr_file}")
+                subprocess.run([
+                    compress_bin,
+                    *compress_params,
+                    f'logs/{curr_file}'
+                ])
+                # Update the current file extension
+                curr_file += f'.{compress_ext}'
+                f_ext     += f'.{compress_ext}'
 
-        logger.info(f"Moving {curr_file} to {final_path}")
-        shutil.move(f"logs/{curr_file}", f"{final_path}/{curr_file}")
+            logger.info(f"Moving {curr_file} to {final_path}")
+            shutil.move(f"logs/{curr_file}", f"{final_path}/{curr_file}")
+        except Exception as exc:
+            logger.error(f"Error processing '{curr_file}': {exc}")
 
     logger.debug("Done")
 
