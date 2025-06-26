@@ -10,7 +10,7 @@ import subprocess
 # Globals
 logger = logging.getLogger(__name__)
 
-def parse_filename(curr_file: str) -> tuple(str):
+def parse_filename(curr_file: str) -> tuple[str,str,str,str,str,str]:
     """Parse file name to extract metadata.
 
     Args:
