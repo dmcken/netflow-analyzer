@@ -37,6 +37,35 @@ def parse_filename(curr_file: str) -> tuple[str,str,str,str,str,str]:
 
     return (year, month, day, hour, minute, f_ext)
 
+def set_container_log_permissions(file_uid: int, file_gid: int,
+                                  log_file_regex: str) -> None:
+    """Set permissions on the log files in the container
+    """
+    # Set permissions on base folder
+    result = subprocess.run([
+        'docker','compose','exec','goflow2','sh','-c',
+        f'chown {file_uid}:{file_gid} /var/log/goflow/',
+    ], capture_output=True)
+    if result.returncode != 0:
+        msg = (
+            f"Error setting the permissions on folder {result.returncode}\n" +
+            f"{result.stderr} / {result.stdout}"
+        )
+        raise RuntimeError(msg)
+
+    # Set permissions on log files we are about to archive
+    result = subprocess.run([
+        'docker','compose','exec','goflow2','sh','-c',
+        f'chown {file_uid}:{file_gid} /var/log/goflow/{log_file_regex}',
+    ], capture_output=True)
+    if result.returncode != 0:
+        msg = (
+            f"Error setting the permissions on folder {result.returncode}\n" +
+            f"{result.stderr} / {result.stdout}"
+        )
+        raise RuntimeError(msg)
+
+    return
 
 def main() -> None:
     '''Main function'''
@@ -64,20 +93,13 @@ def main() -> None:
     # Required for docker compose
     os.chdir(dir_base)
 
-    # Set permissions on current files within container
-    # Set permissions on base folder
-    result = subprocess.run([
-        'docker','compose','exec','goflow2','sh','-c',
-        f'chown {file_uid}:{file_gid} /var/log/goflow/',
-    ], capture_output=True)
-    # Set permissions on log files we are about to archive
-    result = subprocess.run([
-        'docker','compose','exec','goflow2','sh','-c',
-        f'chown {file_uid}:{file_gid} /var/log/goflow/{log_file_regex}',
-    ], capture_output=True)
+    try:
+        set_container_log_permissions(file_uid,file_gid,log_file_regex)
+    except RuntimeError as exc:
+        logger.error("Error 'set_container_log_permissions': {exc}")
+        return
 
-
-    # goflow2_20250612_2330.log
+    # Get the list of files to check and move
     log_files = list(filter(
         lambda x: re.match(log_file_regex, x),
         os.listdir('logs/'),
