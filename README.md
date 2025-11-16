@@ -54,6 +54,8 @@ At the moment, I'm at least experimenting with two major solutions:
         * Clickhouse:
         * Custom:
             * Direct storage in avro, protobuf, etc.
+* Pipeline:
+    * Kafka is complex can https://github.com/redpanda-data/redpanda provide an appropriate pipeline?
 * With goflow2 and custom fields mapped how do I generate the updated protobuf file?
 * Done
 
