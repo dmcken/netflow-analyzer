@@ -19,14 +19,12 @@ def parse_filename(curr_file: str) -> tuple[str,str,str,str,str,str]:
     Returns:
         tuple(str): Tuple holding the values parsed.
     """
-
     res = re.match(
         'goflow2_([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2}).([A-Za-z0-9\.]*)',
         curr_file,
     )
     if not res:
         raise RuntimeError(f"Invalid file name")
-
 
     year    = res.group(1)
     month   = res.group(2)
