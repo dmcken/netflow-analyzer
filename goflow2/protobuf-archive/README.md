@@ -40,7 +40,9 @@ add dst-address=<goflow2 host> src-address=<router lo> version=ipfix
 ```
 
 
-## Compression comparison
+## Long term storage
+
+So the output this setup works
 
 Algorithms / formats:
 * 7z
@@ -50,8 +52,15 @@ Algorithms / formats:
 * xz
 * zip
 
-Comparison (using a sample 506,284,009 file):
-| Format | Parameters | Compressed size | Compression Percentage | Time elapsed |
+### Compression comparison:
+
+Input:
+* 506,284,009 byte file
+* goflow2 protobuf output
+* 3,958,409 records
+* with 0x0A record separator
+
+| Format | Parameters | Compressed size (bytes) | Compression Percentage (%) | Time elapsed |
 | ------ | ---------- | ---------- | ---------- | ------------ |
 | bzip2 | -1 | 72,907,925 | 14.4006% | 0:00:41.656107 |
 | bzip2 | -5 | 65,580,484 | 12.9533% | 0:00:44.698288 |
@@ -106,3 +115,9 @@ docker compose exec goflow2 sh -c "chown 1000:1000 /var/log/goflow/goflow2_[0-9]
 
 Change 1000:1000 to your user as appropriate and you can then work on the files as if they are owned by your user (compress, move, etc).
 
+
+
+# Notes:
+
+* Possible file formats:
+    * F3 - https://github.com/future-file-format/F3 / https://medium.com/@reliabledataengineering/f3-the-future-proof-file-format-that-finally-gets-it-right-0e7f0ddd2e72
