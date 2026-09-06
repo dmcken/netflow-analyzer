@@ -1,0 +1,15 @@
+[Unit]
+Description=Read-only HTTP API for the Parquet flow archive
+After=network.target
+
+[Service]
+Type=simple
+User=airlink
+ExecStart=/home/airlink/flow-api/flow-api \
+    --data-dir /mnt/netflow/airlink-logs/parquet \
+    --listen-addr 0.0.0.0:8090
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
