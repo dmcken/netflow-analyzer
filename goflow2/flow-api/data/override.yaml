@@ -1,0 +1,24 @@
+- network: 10.0.0.0/8
+  asn: 61478
+  organization: "AirLink-DH - RFC1918-10/8"
+  country_code: "TT"
+- network: 100.64.0.0/10
+  asn: 61478
+  organization: "AirLink-DH - RFC6598-100.64/10"
+  country_code: "TT"
+- network: 172.16.0.0/12
+  asn: 264811
+  organization: "AirLink-DC - RFC1918-172.16/12"
+  country_code: "TT"
+- network: 169.254.0.0/16
+  asn: 61478
+  organization: "AirLink-DC - RFC3927-169.254/16"
+  country_code: "TT"
+- network: 192.168.0.0/16
+  asn: 61478
+  organization: "AirLink-DH - RFC1918-192.168/16"
+  country_code: "TT"
+- network: 172.18.0.0/16
+  asn: 393434
+  organization: "AirLink-DC - RFC1918-172.18/16"
+  country_code: "US"

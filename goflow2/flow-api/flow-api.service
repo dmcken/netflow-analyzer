@@ -7,7 +7,9 @@ Type=simple
 User=airlink
 ExecStart=/home/airlink/flow-api/flow-api \
     --data-dir /mnt/netflow/airlink-logs/parquet \
-    --listen-addr 0.0.0.0:8090
+    --listen-addr 0.0.0.0:8090 \
+    --ip2asn-path /home/airlink/flow-api/data/ip2asn-combined.tsv.gz \
+    --override-path /home/airlink/flow-api/data/override.yaml
 Restart=on-failure
 RestartSec=5
 

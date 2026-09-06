@@ -11,3 +11,4 @@ pgdata/
 goflow2/archiver/target/
 goflow2/parquet-datalake/target/
 goflow2/flow-api/target/
+goflow2/flow-api/data/ip2asn-combined.tsv.gz
