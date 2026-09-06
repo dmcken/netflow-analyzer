@@ -9,3 +9,4 @@ pgdata/
 
 # Rust output
 goflow2/archiver/target/
+goflow2/parquet-datalake/target/

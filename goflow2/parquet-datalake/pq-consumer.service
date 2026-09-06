@@ -1,0 +1,20 @@
+[Unit]
+Description=goflow2 FIFO -> Parquet data lake consumer
+After=docker.service
+
+[Service]
+Type=simple
+User=airlink
+ExecStart=/home/airlink/parquet-datalake/pq-consumer \
+    --fifo /mnt/netflow/airlink-logs/fifo/goflow2.fifo \
+    --output-dir /mnt/netflow/airlink-logs/parquet \
+    --flush-interval-secs 300 \
+    --zstd-level 12
+Restart=on-failure
+RestartSec=5
+# Give a clean SIGTERM time to flush the in-progress batch before the
+# service manager escalates to SIGKILL.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
