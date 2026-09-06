@@ -69,3 +69,22 @@ ipfix:
       destination: post_napt_src_transport_port
     - field: 228
       destination: post_napt_dst_transport_port
+# The Mikrotik router is actually exporting NetFlow V9 on the wire (version
+# field = 9, confirmed via raw packet capture), not true IPFIX, despite
+# being configured with `version=ipfix`. goflow2 keeps separate mappers for
+# the "ipfix" and "netflowv9" sections (producer/proto/config_impl.go) and
+# only applies whichever one matches the actual decoder that processed the
+# packet - so the ipfix: mapping above has never applied to this traffic.
+# Confirmed via packet capture that the router sends real, correctly
+# populated postNAT/postNAPT values on every record; this was a config gap,
+# not missing data.
+netflowv9:
+  mapping:
+    - field: 225
+      destination: post_nat_src_ipv4_address
+    - field: 226
+      destination: post_nat_dst_ipv4_address
+    - field: 227
+      destination: post_napt_src_transport_port
+    - field: 228
+      destination: post_napt_dst_transport_port

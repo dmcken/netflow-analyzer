@@ -103,6 +103,16 @@ struct Flow<'a> {
     in_if: u32,
     out_if: u32,
     tcp_flags: u32,
+    // CGNAT translation - the field that makes an abuse report ("public IP
+    // X at time T") traceable back to a customer. Populated via a custom
+    // field-map.yaml mapping (IPFIX IEs 225-228, re-emitted by goflow2 as
+    // custom protobuf fields 2225-2228). Raw bytes as goflow2 emits them -
+    // see the comment on post_nat_src_ipv4_address's handling below for why
+    // this isn't a plain IP-length slice.
+    post_nat_src_ipv4_address: &'a [u8],
+    post_nat_dst_ipv4_address: &'a [u8],
+    post_napt_src_transport_port: u32,
+    post_napt_dst_transport_port: u32,
 }
 
 // FlowMessage field numbers, from pb/flow.proto (netsampler/goflow2).
@@ -120,6 +130,11 @@ const F_IN_IF: u64 = 18;
 const F_OUT_IF: u64 = 19;
 const F_TCP_FLAGS: u64 = 26;
 const F_TIME_RECEIVED_NS: u64 = 110;
+// Custom fields declared in field-map.yaml's `protobuf:` section.
+const F_POST_NAT_SRC_IPV4: u64 = 2225;
+const F_POST_NAT_DST_IPV4: u64 = 2226;
+const F_POST_NAPT_SRC_PORT: u64 = 2227;
+const F_POST_NAPT_DST_PORT: u64 = 2228;
 
 /// Scan a FlowMessage's raw wire bytes into a Flow, without allocating.
 /// Unknown/unused fields (type, sequence_num, next_hop, etype, MACs,
@@ -150,6 +165,8 @@ fn scan_flow(frame: &[u8]) -> Option<Flow<'_>> {
                     F_IN_IF => flow.in_if = val as u32,
                     F_OUT_IF => flow.out_if = val as u32,
                     F_TCP_FLAGS => flow.tcp_flags = val as u32,
+                    F_POST_NAPT_SRC_PORT => flow.post_napt_src_transport_port = val as u32,
+                    F_POST_NAPT_DST_PORT => flow.post_napt_dst_transport_port = val as u32,
                     _ => {}
                 }
             }
@@ -164,6 +181,8 @@ fn scan_flow(frame: &[u8]) -> Option<Flow<'_>> {
                     F_SAMPLER_ADDRESS => flow.sampler_address = slice,
                     F_SRC_ADDR => flow.src_addr = slice,
                     F_DST_ADDR => flow.dst_addr = slice,
+                    F_POST_NAT_SRC_IPV4 => flow.post_nat_src_ipv4_address = slice,
+                    F_POST_NAT_DST_IPV4 => flow.post_nat_dst_ipv4_address = slice,
                     _ => {}
                 }
                 offset = end;
@@ -224,6 +243,10 @@ struct Batch {
     in_if: UInt32Builder,
     out_if: UInt32Builder,
     tcp_flags: UInt8Builder,
+    post_nat_src_ipv4_address: BinaryBuilder,
+    post_nat_dst_ipv4_address: BinaryBuilder,
+    post_napt_src_transport_port: UInt16Builder,
+    post_napt_dst_transport_port: UInt16Builder,
     rows: usize,
     window_start_ns: i64,
     window_end_ns: i64,
@@ -246,6 +269,10 @@ impl Batch {
             in_if: UInt32Builder::new(),
             out_if: UInt32Builder::new(),
             tcp_flags: UInt8Builder::new(),
+            post_nat_src_ipv4_address: BinaryBuilder::new(),
+            post_nat_dst_ipv4_address: BinaryBuilder::new(),
+            post_napt_src_transport_port: UInt16Builder::new(),
+            post_napt_dst_transport_port: UInt16Builder::new(),
             rows: 0,
             window_start_ns: i64::MAX,
             window_end_ns: i64::MIN,
@@ -276,6 +303,23 @@ impl Batch {
         self.tcp_flags
             .append_option((f.proto == 6).then_some(f.tcp_flags as u8));
 
+        // Empty (proto3-omitted, field truly absent) means this flow wasn't
+        // NAT-translated - store as NULL, distinct from an actual value.
+        if f.post_nat_src_ipv4_address.is_empty() {
+            self.post_nat_src_ipv4_address.append_null();
+        } else {
+            self.post_nat_src_ipv4_address.append_value(f.post_nat_src_ipv4_address);
+        }
+        if f.post_nat_dst_ipv4_address.is_empty() {
+            self.post_nat_dst_ipv4_address.append_null();
+        } else {
+            self.post_nat_dst_ipv4_address.append_value(f.post_nat_dst_ipv4_address);
+        }
+        self.post_napt_src_transport_port
+            .append_option((f.post_napt_src_transport_port != 0).then_some(f.post_napt_src_transport_port as u16));
+        self.post_napt_dst_transport_port
+            .append_option((f.post_napt_dst_transport_port != 0).then_some(f.post_napt_dst_transport_port as u16));
+
         self.rows += 1;
         self.window_start_ns = self.window_start_ns.min(f.time_flow_start_ns);
         self.window_end_ns = self.window_end_ns.max(f.time_flow_start_ns);
@@ -297,6 +341,10 @@ impl Batch {
             Field::new("in_if", DataType::UInt32, false),
             Field::new("out_if", DataType::UInt32, false),
             Field::new("tcp_flags", DataType::UInt8, true),
+            Field::new("post_nat_src_ipv4_address", DataType::Binary, true),
+            Field::new("post_nat_dst_ipv4_address", DataType::Binary, true),
+            Field::new("post_napt_src_transport_port", DataType::UInt16, true),
+            Field::new("post_napt_dst_transport_port", DataType::UInt16, true),
         ])
     }
 
@@ -320,6 +368,10 @@ impl Batch {
             Arc::new(self.in_if.finish()),
             Arc::new(self.out_if.finish()),
             Arc::new(self.tcp_flags.finish()),
+            Arc::new(self.post_nat_src_ipv4_address.finish()),
+            Arc::new(self.post_nat_dst_ipv4_address.finish()),
+            Arc::new(self.post_napt_src_transport_port.finish()),
+            Arc::new(self.post_napt_dst_transport_port.finish()),
         ];
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
         let row_count = batch.num_rows();
