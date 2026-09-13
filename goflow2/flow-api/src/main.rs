@@ -14,8 +14,15 @@
 //! made this data available at all).
 
 mod asn;
+mod cidr;
 
-use std::{collections::HashMap, net::IpAddr, path::PathBuf, sync::Arc};
+use std::{
+    any::Any,
+    collections::HashMap,
+    net::IpAddr,
+    path::PathBuf,
+    sync::{atomic::AtomicU64, Arc},
+};
 
 use axum::{
     extract::{Query, State},
@@ -27,14 +34,18 @@ use axum::{
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use datafusion::{
-    arrow::datatypes::DataType,
+    arrow::{array::BooleanBuilder, datatypes::DataType},
+    common::Result as DFResult,
     datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
+    logical_expr::{ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility},
     prelude::*,
 };
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use asn::AsnDb;
+use cidr::PrefixRanges;
 
 const FLOWS_TABLE: &str = "flows";
 
@@ -60,6 +71,11 @@ struct Cli {
 struct AppState {
     ctx: SessionContext,
     asn_db: AsnDb,
+    /// Source of unique names for the per-request CIDR-match UDF
+    /// asn_peer_stats registers - see its doc comment. Relaxed ordering is
+    /// fine: uniqueness across concurrent requests is all that's needed,
+    /// not any particular order.
+    next_udf_id: AtomicU64,
 }
 
 #[tokio::main]
@@ -71,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     register_flows_table(&ctx, &args.data_dir).await?;
     let asn_db = AsnDb::load(&args.ip2asn_path, &args.override_path)?;
 
-    let state = Arc::new(AppState { ctx, asn_db });
+    let state = Arc::new(AppState { ctx, asn_db, next_udf_id: AtomicU64::new(0) });
 
     let app = Router::new()
         .route("/health", get(health))
@@ -79,6 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/flows", get(flows))
         .route("/v1/traffic-stats", get(traffic_stats))
         .route("/v1/asn-stats", get(asn_stats))
+        .route("/v1/asn-peer-stats", get(asn_peer_stats))
         .with_state(state);
 
     tracing::info!("listening on {}", args.listen_addr);
@@ -533,8 +550,31 @@ async fn asn_stats(State(state): State<Arc<AppState>>, Query(params): Query<AsnS
         Err(resp) => return resp,
     };
 
+    let stats = aggregate_by_asn(&batches, &state.asn_db, params.top);
+
+    Json(json!({
+        "query": {
+            "direction": if params.direction == AsnDirection::Outbound { "outbound" } else { "inbound" },
+            "start": params.start.to_rfc3339(),
+            "end": params.end.to_rfc3339(),
+            "top": params.top,
+        },
+        "asn_stats": stats,
+    }))
+    .into_response()
+}
+
+/// Shared by /v1/asn-stats and /v1/asn-peer-stats: collapse a RecordBatch of
+/// (addr, total_bytes, total_packets, flow_count) rows - one row per
+/// distinct IP, already summed by DataFusion - into per-ASN totals via a
+/// CIDR-range lookup per row, then keep the top N by bytes.
+fn aggregate_by_asn(
+    batches: &[datafusion::arrow::record_batch::RecordBatch],
+    asn_db: &AsnDb,
+    top: usize,
+) -> Vec<AsnStat> {
     let mut per_asn: HashMap<u32, (String, String, i64, i64, i64)> = HashMap::new();
-    for batch in &batches {
+    for batch in batches {
         use datafusion::arrow::array::*;
         let addr = batch.column_by_name("addr");
         let total_bytes = batch.column_by_name("total_bytes").and_then(|c| c.as_any().downcast_ref::<Int64Array>());
@@ -544,7 +584,7 @@ async fn asn_stats(State(state): State<Arc<AppState>>, Query(params): Query<AsnS
         for i in 0..batch.num_rows() {
             let Some(raw) = addr.and_then(|a| binary_at(a, i)) else { continue };
             let Some(ip) = bytes_to_ip(&raw) else { continue };
-            let Some(info) = state.asn_db.lookup(ip) else { continue };
+            let Some(info) = asn_db.lookup(ip) else { continue };
 
             let entry = per_asn.entry(info.asn).or_insert_with(|| (info.org.clone(), info.country.clone(), 0, 0, 0));
             entry.2 += total_bytes.map(|a| a.value(i)).unwrap_or(0);
@@ -565,18 +605,164 @@ async fn asn_stats(State(state): State<Arc<AppState>>, Query(params): Query<AsnS
         })
         .collect();
     stats.sort_by_key(|s| std::cmp::Reverse(s.total_bytes));
-    stats.truncate(params.top);
+    stats.truncate(top);
+    stats
+}
+
+// ---------- tier 4: peer-ASN analysis (traffic between one ASN's own
+// known prefixes and every other ASN) ----------
+
+#[derive(Deserialize)]
+struct AsnPeerStatsParams {
+    /// Comma-separated CIDR list for the ASN being viewed (its known
+    /// prefixes, e.g. from Netbox) - the "near" side of every flow this
+    /// endpoint looks at, distinct from the public ip2asn database used to
+    /// classify the "far" side.
+    prefixes: String,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    #[serde(default = "default_asn_top")]
+    top: usize,
+}
+
+/// ASN-level breakdown of traffic between one ASN's own known prefixes
+/// (`prefixes`, not looked up from the ip2asn database - the caller already
+/// knows these, e.g. from Netbox) and every other ASN. Two directions in
+/// one response, both scoped to the same prefix list:
+/// - `outbound`: `prefixes` as source, grouped by destination ASN - who
+///   this ASN is sending traffic to.
+/// - `inbound`: `prefixes` as destination, grouped by source ASN - who is
+///   sending traffic to this ASN.
+///
+/// Unlike /v1/asn-stats (which aggregates every flow in the archive),
+/// this narrows the scan to just the flows touching the given ASN's own
+/// address space on one side. A first version expressed that as a SQL
+/// `WHERE addr BETWEEN X'..' AND X'..' OR ...` per prefix - correct, but it
+/// doesn't scale: DataFusion evaluates a big OR chain per row with no way
+/// to turn it into a binary search, and a ~300-prefix list (a real ASN's
+/// full known range, even after collapsing adjacent CIDRs) took over three
+/// minutes against a 15-minute window and didn't finish. Registering a
+/// one-off `cidr_match_<n>` scalar UDF per request instead - backed by the
+/// same sorted-range binary search `asn::AsnDb` already uses for its (much
+/// smaller) override list - turns "is this row's address in the prefix
+/// list" into an O(log prefixes) check per row instead of O(prefixes).
+/// A unique per-request name avoids two concurrent requests racing on
+/// `SessionContext::register_udf`, which registers into state shared
+/// across all requests; `deregister_udf` cleans it up again once both
+/// queries below are done (including on an error return) so the registry
+/// doesn't grow unbounded across the process's lifetime.
+async fn asn_peer_stats(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AsnPeerStatsParams>,
+) -> impl IntoResponse {
+    let prefixes: Result<Vec<IpNet>, _> = params.prefixes.split(',').map(|p| p.trim().parse::<IpNet>()).collect();
+    let prefixes = match prefixes {
+        Ok(p) if !p.is_empty() => p,
+        Ok(_) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": "prefixes must not be empty"}))).into_response()
+        }
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("invalid prefix: {e}")})))
+                .into_response()
+        }
+    };
+
+    let start_ns = params.start.timestamp_nanos_opt().unwrap_or(0);
+    let end_ns = params.end.timestamp_nanos_opt().unwrap_or(0);
+
+    let udf_id = state.next_udf_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let udf_name = format!("cidr_match_{udf_id}");
+    let ranges = Arc::new(PrefixRanges::new(&prefixes));
+    state.ctx.register_udf(ScalarUDF::from(CidrMatchUdf {
+        name: udf_name.clone(),
+        signature: Signature::any(1, Volatility::Immutable),
+        ranges,
+    }));
+
+    let outbound_sql = format!(
+        "SELECT dst_addr AS addr, SUM(bytes) AS total_bytes, SUM(packets) AS total_packets, COUNT(*) AS flow_count \
+         FROM {FLOWS_TABLE} \
+         WHERE time_flow_start_ns <= {end_ns} AND time_flow_start_ns >= {start_ns} \
+           AND {udf_name}(src_addr) \
+         GROUP BY dst_addr"
+    );
+    let inbound_sql = format!(
+        "SELECT src_addr AS addr, SUM(bytes) AS total_bytes, SUM(packets) AS total_packets, COUNT(*) AS flow_count \
+         FROM {FLOWS_TABLE} \
+         WHERE time_flow_start_ns <= {end_ns} AND time_flow_start_ns >= {start_ns} \
+           AND {udf_name}(dst_addr) \
+         GROUP BY src_addr"
+    );
+
+    let outbound_batches = match run_sql(&state.ctx, &outbound_sql).await {
+        Ok(b) => b,
+        Err(resp) => {
+            state.ctx.deregister_udf(&udf_name);
+            return resp;
+        }
+    };
+    let inbound_batches = match run_sql(&state.ctx, &inbound_sql).await {
+        Ok(b) => b,
+        Err(resp) => {
+            state.ctx.deregister_udf(&udf_name);
+            return resp;
+        }
+    };
+    state.ctx.deregister_udf(&udf_name);
+
+    let outbound = aggregate_by_asn(&outbound_batches, &state.asn_db, params.top);
+    let inbound = aggregate_by_asn(&inbound_batches, &state.asn_db, params.top);
 
     Json(json!({
         "query": {
-            "direction": if params.direction == AsnDirection::Outbound { "outbound" } else { "inbound" },
+            "prefixes": prefixes.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
             "start": params.start.to_rfc3339(),
             "end": params.end.to_rfc3339(),
             "top": params.top,
         },
-        "asn_stats": stats,
+        "outbound": outbound,
+        "inbound": inbound,
     }))
     .into_response()
+}
+
+/// Scalar UDF wrapping one request's `PrefixRanges` - see asn_peer_stats'
+/// doc comment for why this replaced a plain SQL OR chain.
+#[derive(Debug)]
+struct CidrMatchUdf {
+    name: String,
+    signature: Signature,
+    ranges: Arc<PrefixRanges>,
+}
+
+impl ScalarUDFImpl for CidrMatchUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn invoke_batch(&self, args: &[ColumnarValue], number_rows: usize) -> DFResult<ColumnarValue> {
+        let array = args[0].clone().into_array(number_rows)?;
+        let mut builder = BooleanBuilder::with_capacity(array.len());
+        for i in 0..array.len() {
+            match binary_at(array.as_ref(), i) {
+                Some(bytes) => builder.append_value(self.ranges.contains_bytes(&bytes)),
+                None => builder.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+    }
 }
 
 fn bytes_to_ip(bytes: &[u8]) -> Option<IpAddr> {

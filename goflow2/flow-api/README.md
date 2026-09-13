@@ -131,6 +131,40 @@ the intended custom mapping, the entire time that tool existed. Fixed in
 the copy `flow-api` uses (`data/override.yaml`); worth fixing upstream too
 if `goflow2_analysis` is still used anywhere.
 
+### `GET /v1/asn-peer-stats`
+
+ASN-level breakdown of traffic between one ASN's own known prefixes and
+every other ASN - "who is this ASN sending traffic to / receiving traffic
+from" for a specific network the caller already knows the address space
+of (e.g. from Netbox), rather than the whole archive.
+
+Params: `prefixes` (comma-separated CIDR list), `start`, `end` (RFC3339), `top` (default 20).
+
+```
+curl 'http://localhost:8090/v1/asn-peer-stats?prefixes=10.2.19.0/24,10.2.20.0/24&start=2026-09-12T00:00:00Z&end=2026-09-12T00:15:00Z&top=5'
+```
+
+Response has both directions, both scoped to the same prefix list:
+- `outbound`: `prefixes` as source, grouped by destination ASN.
+- `inbound`: `prefixes` as destination, grouped by source ASN.
+
+Unlike `/v1/asn-stats` (aggregates the whole archive), this narrows the
+scan to flows touching the given prefixes on one side. A first version
+expressed that as a SQL `WHERE addr BETWEEN X'..' AND X'..' OR ...` per
+prefix - correct, but it doesn't scale: DataFusion evaluates a big OR
+chain per row with no way to turn it into a binary search, and a
+~300-prefix list (a real ASN's full known range, even after collapsing
+adjacent CIDRs) took over three minutes against a 15-minute window and
+didn't finish. It's a one-off `cidr_match_<n>` scalar UDF per request now
+instead - backed by the same sorted-range binary search `asn::AsnDb`
+already uses for its (much smaller) override list - which turns "is this
+row's address in the prefix list" into an O(log prefixes) check per row.
+A unique per-request UDF name avoids concurrent requests racing on
+`SessionContext::register_udf` (registers into state shared across all
+requests); `deregister_udf` cleans it up again afterward either way, so
+the registry doesn't grow unbounded across the process's lifetime. Same
+~300-prefix/15-minute case: ~30s after the rewrite.
+
 ### `GET /health`
 
 Liveness check.
