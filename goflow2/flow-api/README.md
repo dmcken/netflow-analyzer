@@ -165,6 +165,63 @@ requests); `deregister_udf` cleans it up again afterward either way, so
 the registry doesn't grow unbounded across the process's lifetime. Same
 ~300-prefix/15-minute case: ~30s after the rewrite.
 
+Also takes an optional `exclude_asns` (comma-separated ASN numbers,
+default empty) - dropped from the results before ranking, so an excluded
+ASN never displaces a real top-N entry. Useful for excluding a peering
+partner from a capacity-planning view.
+
+### `GET /v1/asn-peer-timeseries`
+
+Time-bucketed version of `/v1/asn-peer-stats`, for a stacked-over-time
+chart (e.g. a day view): same prefix-scoped outbound/inbound breakdown,
+grouped by (time bucket, far-side ASN) instead of just far-side ASN.
+
+Params: same as `/v1/asn-peer-stats`, plus `bucket_secs` (default 300).
+
+```
+curl 'http://localhost:8090/v1/asn-peer-timeseries?prefixes=10.2.19.0/24&start=2026-09-12T00:00:00Z&end=2026-09-13T00:00:00Z&bucket_secs=3600&top=15'
+```
+
+The top N ASNs are chosen by their TOTAL over the *whole* window, not
+per-bucket - ranking per-bucket independently would let a different set
+of ASNs appear in each bucket, making an incoherent stacked chart (series
+popping in and out). Every (top-N ASN, bucket) pair is emitted even when
+that ASN had zero traffic in a given bucket, so the client can pivot this
+directly into fixed-length per-ASN series without handling gaps.
+
+**Both endpoints add a Hive partition filter** (`year=`/`month=`/`day=`)
+alongside the `time_flow_start_ns` bounds, padded by one full day on each
+side. Without it, DataFusion lists and checks every file across the
+*entire* archive (not just the requested window) before row-group
+statistics get a chance to skip irrelevant data - with several days'
+worth of 5-minute files accumulated, that overhead alone dominated a
+2-hour `asn-peer-timeseries` query's runtime. **The padding matters and
+is not optional**: a first version filtered to just the requested day(s)
+with no padding, and it silently dropped real data - `parquet-datalake`'s
+`partition_path()` (see `goflow2/parquet-datalake/src/main.rs`) assigns a
+file's directory from the *write-window's* start time, not each flow's
+own `time_flow_start_ns`, so a 5-minute flush window straddling midnight
+is written entirely under the earlier day even though some of its flows
+timestamp into the next day. A query for `00:00`-`00:15` filtered to only
+that day's partition missed exactly those spillover flows - caught by
+comparing `asn-peer-stats`' output for that exact window before and after
+adding the filter (inbound went from real, populated results to empty).
+One day of padding comfortably covers that spillover (bounded by the
+flush window) without needing exact knowledge of the write-time/flow-time
+skew, at the cost of scanning up to 2 extra days.
+
+**Known remaining cost**: for a full day at real production volume (this
+network's own full prefix list, ~295 CIDRs after collapsing, against a
+day with hundreds of millions of raw flow rows), `asn-peer-timeseries`
+is CPU-bound (confirmed via a 400%+, multi-core-pegged process, not
+blocked on I/O) and can take several minutes - the per-row CIDR-match UDF
+call still has to run once per raw row before any grouping happens, and
+that per-row cost times the row count dominates once file-listing
+overhead is no longer the bottleneck. Not yet addressed; a next step
+would be pushing the CIDR check down as a native vectorized DataFusion
+operator instead of a scalar UDF, or accepting this as a background/
+async job rather than a synchronous request for the heaviest case.
+
 ### `GET /health`
 
 Liveness check.
