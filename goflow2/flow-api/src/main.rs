@@ -111,10 +111,20 @@ impl<T> CacheEntry<T> {
 
 const OPEN_WINDOW_CACHE_TTL: StdDuration = StdDuration::from_secs(300);
 // How far in the past `end` must be before its window is treated as fully
-// elapsed (and thus cacheable forever) - a safety margin over the ~5-minute
-// flush window parquet-datalake writes in, so a "closed" window can't
-// still be missing not-yet-flushed data.
-const WINDOW_CLOSED_MARGIN: Duration = Duration::minutes(10);
+// elapsed (and thus cacheable forever). New parquet FILES land every ~5
+// minutes, but that's not the number that matters here: checked across a
+// full day (275 files), each file's own internal time_flow_start_ns span
+// is consistently ~35 minutes (2074.9s-2124.2s), not 5 - routers/exporters
+// re-report long-lived flows periodically while keeping their *original*
+// start time, so a record for "now" can carry a time_flow_start_ns up to
+// ~35 minutes old. The first version of this margin (10 minutes) was
+// tuned to the file-creation cadence instead of this, which meant windows
+// got marked "closed, cache forever" while still up to ~25 minutes short
+// of having all their data - a cache entry frozen in that state never
+// corrects itself, which is a correctness bug (silently undercounted
+// results), not just a staleness one. 45 minutes gives a comfortable
+// margin over the observed ~35-minute max.
+const WINDOW_CLOSED_MARGIN: Duration = Duration::minutes(45);
 
 /// Whether [start, end) is fully in the past (by WINDOW_CLOSED_MARGIN) and
 /// therefore immutable - if so, its cache entry never needs to expire.
