@@ -217,10 +217,38 @@ is CPU-bound (confirmed via a 400%+, multi-core-pegged process, not
 blocked on I/O) and can take several minutes - the per-row CIDR-match UDF
 call still has to run once per raw row before any grouping happens, and
 that per-row cost times the row count dominates once file-listing
-overhead is no longer the bottleneck. Not yet addressed; a next step
-would be pushing the CIDR check down as a native vectorized DataFusion
-operator instead of a scalar UDF, or accepting this as a background/
-async job rather than a synchronous request for the heaviest case.
+overhead is no longer the bottleneck. Partially addressed by the
+in-memory cache below (repeat queries against the same window are ~1000x
+faster), but a first, never-before-cached query at full scale is still
+CPU-bound; a next step for *that* case would be pushing the CIDR check
+down as a native vectorized DataFusion operator instead of a scalar UDF,
+or accepting it as a background/async job rather than a synchronous
+request for the heaviest case (coremiddleware's own consumer of this API
+already does the latter, for exactly this reason).
+
+**In-memory caching (`asn-peer-stats` and `asn-peer-timeseries` only)**:
+both endpoints cache their *full* per-ASN breakdown - every counterpart
+ASN, before `top`/`exclude_asns` are applied - keyed on `prefixes` (order-
+independent) + the time range (+ `bucket_secs` for the timeseries
+endpoint). `top` and `exclude_asns` are deliberately left out of the key
+and instead applied fresh on every request, cache hit or not: they're
+cheap to recompute (a sort + truncate, or a HashMap group-by, over an
+already-small per-ASN list), so a request that only changes which ASNs
+are excluded or how many rows it wants is still a cache hit against the
+same underlying data instead of forcing a new multi-minute query.
+
+Freshness follows from whether the requested window is still open: if
+`end` is more than 10 minutes in the past (`WINDOW_CLOSED_MARGIN` -
+comfortably past parquet-datalake's ~5-minute flush window), the window
+is treated as immutable and cached forever; otherwise it gets a 5-minute
+TTL (`OPEN_WINDOW_CACHE_TTL`), since flows are still arriving for it.
+Cache lives in-memory only (`AppState.peer_stats_cache` /
+`peer_timeseries_cache`, plain `Mutex<HashMap<...>>`) - empties on every
+restart, no persistence to disk. A crude size cap
+(`CACHE_MAX_ENTRIES` = 500) clears the whole cache if ever exceeded,
+rather than proper LRU eviction - the realistic number of distinct
+(prefixes, window, bucket_secs) combinations actually queried in
+practice is expected to stay far below that.
 
 ### `GET /health`
 

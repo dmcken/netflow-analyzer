@@ -21,7 +21,8 @@ use std::{
     collections::HashMap,
     net::IpAddr,
     path::PathBuf,
-    sync::{atomic::AtomicU64, Arc},
+    sync::{atomic::AtomicU64, Arc, Mutex},
+    time::{Duration as StdDuration, Instant},
 };
 
 use axum::{
@@ -76,6 +77,87 @@ struct AppState {
     /// fine: uniqueness across concurrent requests is all that's needed,
     /// not any particular order.
     next_udf_id: AtomicU64,
+    /// Caches for asn_peer_stats/asn_peer_timeseries - see PeerStatsCache's
+    /// doc comment for what's cached and why.
+    peer_stats_cache: Mutex<HashMap<String, CacheEntry<Vec<AsnStat>>>>,
+    peer_timeseries_cache: Mutex<HashMap<String, CacheEntry<Vec<AsnTimeseriesPoint>>>>,
+}
+
+/// One cached (outbound, inbound) result, keyed on everything that
+/// determines the underlying per-ASN data (prefixes/time range/bucket
+/// size) but deliberately *not* `top` or `exclude_asns` - both are cheap
+/// to reapply to an already-fetched full breakdown, so caching before
+/// they're applied means a request that only changes which ASNs are
+/// excluded, or how many rows it wants, is still a cache hit. See
+/// `cache_key`/`cache_expiry`/`get_or_compute` for how this is used.
+struct CacheEntry<T> {
+    outbound: T,
+    inbound: T,
+    /// None means "never expires" - used for a fully-elapsed time window,
+    /// which can't produce different data on a later query. Some(_) is
+    /// used for a window still open (touches "now"), which needs a short
+    /// TTL since new flows keep arriving for it.
+    expires_at: Option<Instant>,
+}
+
+impl<T> CacheEntry<T> {
+    fn is_fresh(&self) -> bool {
+        match self.expires_at {
+            None => true,
+            Some(t) => Instant::now() < t,
+        }
+    }
+}
+
+const OPEN_WINDOW_CACHE_TTL: StdDuration = StdDuration::from_secs(300);
+// How far in the past `end` must be before its window is treated as fully
+// elapsed (and thus cacheable forever) - a safety margin over the ~5-minute
+// flush window parquet-datalake writes in, so a "closed" window can't
+// still be missing not-yet-flushed data.
+const WINDOW_CLOSED_MARGIN: Duration = Duration::minutes(10);
+
+/// Whether [start, end) is fully in the past (by WINDOW_CLOSED_MARGIN) and
+/// therefore immutable - if so, its cache entry never needs to expire.
+fn window_is_closed(end: DateTime<Utc>) -> bool {
+    Utc::now() - end > WINDOW_CLOSED_MARGIN
+}
+
+fn cache_expiry(end: DateTime<Utc>) -> Option<Instant> {
+    if window_is_closed(end) {
+        None
+    } else {
+        Some(Instant::now() + OPEN_WINDOW_CACHE_TTL)
+    }
+}
+
+/// Cache key covering everything that changes the underlying per-ASN data:
+/// the prefix list (order-independent - sorted first) and the time
+/// range/bucket size. Deliberately excludes `top`/`exclude_asns` - see
+/// `CacheEntry`'s doc comment.
+fn cache_key(prefixes: &[IpNet], start_ns: i64, end_ns: i64, bucket_secs: Option<i64>) -> String {
+    let mut sorted: Vec<String> = prefixes.iter().map(|p| p.to_string()).collect();
+    sorted.sort_unstable();
+    format!("{}|{}|{}|{}", sorted.join(","), start_ns, end_ns, bucket_secs.unwrap_or(0))
+}
+
+/// Cap on distinct cache entries kept at once - a crude but sufficient
+/// guard against unbounded growth over a long uptime. In practice the
+/// number of distinct (prefixes, time range, bucket size) combinations
+/// actually queried is expected to stay far below this (a handful of
+/// networks x a handful of recent days x 1-2 bucket sizes), so falling
+/// back to "just clear everything" on overflow isn't expected to bite -
+/// LRU eviction would be overkill for that pattern.
+const CACHE_MAX_ENTRIES: usize = 500;
+
+fn cache_insert<T>(cache: &Mutex<HashMap<String, CacheEntry<T>>>, key: String, entry: CacheEntry<T>) {
+    let mut guard = cache.lock().unwrap();
+    if guard.len() >= CACHE_MAX_ENTRIES {
+        guard.retain(|_, v| v.is_fresh());
+        if guard.len() >= CACHE_MAX_ENTRIES {
+            guard.clear();
+        }
+    }
+    guard.insert(key, entry);
 }
 
 #[tokio::main]
@@ -87,7 +169,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     register_flows_table(&ctx, &args.data_dir).await?;
     let asn_db = AsnDb::load(&args.ip2asn_path, &args.override_path)?;
 
-    let state = Arc::new(AppState { ctx, asn_db, next_udf_id: AtomicU64::new(0) });
+    let state = Arc::new(AppState {
+        ctx,
+        asn_db,
+        next_udf_id: AtomicU64::new(0),
+        peer_stats_cache: Mutex::new(HashMap::new()),
+        peer_timeseries_cache: Mutex::new(HashMap::new()),
+    });
 
     let app = Router::new()
         .route("/health", get(health))
@@ -519,7 +607,7 @@ fn default_asn_top() -> usize {
     20
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct AsnStat {
     asn: u32,
     org: String,
@@ -593,15 +681,12 @@ fn parse_asn_list(raw: &str) -> Result<std::collections::HashSet<u32>, std::num:
 /// Shared by /v1/asn-stats and /v1/asn-peer-stats: collapse a RecordBatch of
 /// (addr, total_bytes, total_packets, flow_count) rows - one row per
 /// distinct IP, already summed by DataFusion - into per-ASN totals via a
-/// CIDR-range lookup per row (dropping any ASN in `exclude` before ranking,
-/// so an excluded ASN never displaces a real top-N entry), then keep the
-/// top N by bytes.
-fn aggregate_by_asn(
-    batches: &[datafusion::arrow::record_batch::RecordBatch],
-    asn_db: &AsnDb,
-    exclude: &std::collections::HashSet<u32>,
-    top: usize,
-) -> Vec<AsnStat> {
+/// CIDR-range lookup per row, sorted by bytes descending. No `exclude`/`top`
+/// applied here - see `rank_asn_stats`, which is deliberately a separate,
+/// cheap step so asn_peer_stats can cache this (the expensive part) keyed
+/// on everything except exclude/top, and still apply either fresh per
+/// request without needing a cache entry per exclude/top combination.
+fn aggregate_by_asn_full(batches: &[datafusion::arrow::record_batch::RecordBatch], asn_db: &AsnDb) -> Vec<AsnStat> {
     let mut per_asn: HashMap<u32, (String, String, i64, i64, i64)> = HashMap::new();
     for batch in batches {
         use datafusion::arrow::array::*;
@@ -614,9 +699,6 @@ fn aggregate_by_asn(
             let Some(raw) = addr.and_then(|a| binary_at(a, i)) else { continue };
             let Some(ip) = bytes_to_ip(&raw) else { continue };
             let Some(info) = asn_db.lookup(ip) else { continue };
-            if exclude.contains(&info.asn) {
-                continue;
-            }
 
             let entry = per_asn.entry(info.asn).or_insert_with(|| (info.org.clone(), info.country.clone(), 0, 0, 0));
             entry.2 += total_bytes.map(|a| a.value(i)).unwrap_or(0);
@@ -637,8 +719,23 @@ fn aggregate_by_asn(
         })
         .collect();
     stats.sort_by_key(|s| std::cmp::Reverse(s.total_bytes));
-    stats.truncate(top);
     stats
+}
+
+/// Drop excluded ASNs and keep the top N - the cheap, always-fresh-per-
+/// request step over `aggregate_by_asn_full`'s (possibly cached) output.
+/// `full` is assumed already sorted by bytes descending.
+fn rank_asn_stats(full: &[AsnStat], exclude: &std::collections::HashSet<u32>, top: usize) -> Vec<AsnStat> {
+    full.iter().filter(|s| !exclude.contains(&s.asn)).take(top).cloned().collect()
+}
+
+fn aggregate_by_asn(
+    batches: &[datafusion::arrow::record_batch::RecordBatch],
+    asn_db: &AsnDb,
+    exclude: &std::collections::HashSet<u32>,
+    top: usize,
+) -> Vec<AsnStat> {
+    rank_asn_stats(&aggregate_by_asn_full(batches, asn_db), exclude, top)
 }
 
 // ---------- tier 4: peer-ASN analysis (traffic between one ASN's own
@@ -741,6 +838,14 @@ fn day_partition_filter(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
 /// across all requests; `deregister_udf` cleans it up again once both
 /// queries below are done (including on an error return) so the registry
 /// doesn't grow unbounded across the process's lifetime.
+///
+/// The full (pre-exclude/top) per-ASN breakdown is cached in
+/// `state.peer_stats_cache`, keyed on prefixes+time range (see
+/// `cache_key`) - a repeat request that only changes `top` or
+/// `exclude_asns` skips the SQL/UDF work entirely. A window that's fully
+/// elapsed (see `window_is_closed`) is cached forever, since it can't
+/// produce different data later; a window still touching "now" gets a
+/// short TTL so newly-arrived flows show up reasonably promptly.
 async fn asn_peer_stats(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AsnPeerStatsParams>,
@@ -759,52 +864,79 @@ async fn asn_peer_stats(
 
     let start_ns = params.start.timestamp_nanos_opt().unwrap_or(0);
     let end_ns = params.end.timestamp_nanos_opt().unwrap_or(0);
-    let day_filter = day_partition_filter(params.start, params.end);
+    let key = cache_key(&prefixes, start_ns, end_ns, None);
 
-    let udf_id = state.next_udf_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let udf_name = format!("cidr_match_{udf_id}");
-    let ranges = Arc::new(PrefixRanges::new(&prefixes));
-    state.ctx.register_udf(ScalarUDF::from(CidrMatchUdf {
-        name: udf_name.clone(),
-        signature: Signature::any(1, Volatility::Immutable),
-        ranges,
-    }));
+    let cached = {
+        let guard = state.peer_stats_cache.lock().unwrap();
+        guard.get(&key).filter(|e| e.is_fresh()).map(|e| (e.outbound.clone(), e.inbound.clone()))
+    };
 
-    let outbound_sql = format!(
-        "SELECT dst_addr AS addr, SUM(bytes) AS total_bytes, SUM(packets) AS total_packets, COUNT(*) AS flow_count \
-         FROM {FLOWS_TABLE} \
-         WHERE time_flow_start_ns <= {end_ns} AND time_flow_start_ns >= {start_ns} \
-           AND ({day_filter}) \
-           AND {udf_name}(src_addr) \
-         GROUP BY dst_addr"
-    );
-    let inbound_sql = format!(
-        "SELECT src_addr AS addr, SUM(bytes) AS total_bytes, SUM(packets) AS total_packets, COUNT(*) AS flow_count \
-         FROM {FLOWS_TABLE} \
-         WHERE time_flow_start_ns <= {end_ns} AND time_flow_start_ns >= {start_ns} \
-           AND ({day_filter}) \
-           AND {udf_name}(dst_addr) \
-         GROUP BY src_addr"
-    );
+    let (outbound_full, inbound_full) = match cached {
+        Some(full) => full,
+        None => {
+            let day_filter = day_partition_filter(params.start, params.end);
 
-    let outbound_batches = match run_sql(&state.ctx, &outbound_sql).await {
-        Ok(b) => b,
-        Err(resp) => {
+            let udf_id = state.next_udf_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let udf_name = format!("cidr_match_{udf_id}");
+            let ranges = Arc::new(PrefixRanges::new(&prefixes));
+            state.ctx.register_udf(ScalarUDF::from(CidrMatchUdf {
+                name: udf_name.clone(),
+                signature: Signature::any(1, Volatility::Immutable),
+                ranges,
+            }));
+
+            let outbound_sql = format!(
+                "SELECT dst_addr AS addr, SUM(bytes) AS total_bytes, SUM(packets) AS total_packets, COUNT(*) AS flow_count \
+                 FROM {FLOWS_TABLE} \
+                 WHERE time_flow_start_ns <= {end_ns} AND time_flow_start_ns >= {start_ns} \
+                   AND ({day_filter}) \
+                   AND {udf_name}(src_addr) \
+                 GROUP BY dst_addr"
+            );
+            let inbound_sql = format!(
+                "SELECT src_addr AS addr, SUM(bytes) AS total_bytes, SUM(packets) AS total_packets, COUNT(*) AS flow_count \
+                 FROM {FLOWS_TABLE} \
+                 WHERE time_flow_start_ns <= {end_ns} AND time_flow_start_ns >= {start_ns} \
+                   AND ({day_filter}) \
+                   AND {udf_name}(dst_addr) \
+                 GROUP BY src_addr"
+            );
+
+            let outbound_batches = match run_sql(&state.ctx, &outbound_sql).await {
+                Ok(b) => b,
+                Err(resp) => {
+                    state.ctx.deregister_udf(&udf_name);
+                    return resp;
+                }
+            };
+            let inbound_batches = match run_sql(&state.ctx, &inbound_sql).await {
+                Ok(b) => b,
+                Err(resp) => {
+                    state.ctx.deregister_udf(&udf_name);
+                    return resp;
+                }
+            };
             state.ctx.deregister_udf(&udf_name);
-            return resp;
+
+            let outbound_full = aggregate_by_asn_full(&outbound_batches, &state.asn_db);
+            let inbound_full = aggregate_by_asn_full(&inbound_batches, &state.asn_db);
+
+            cache_insert(
+                &state.peer_stats_cache,
+                key,
+                CacheEntry {
+                    outbound: outbound_full.clone(),
+                    inbound: inbound_full.clone(),
+                    expires_at: cache_expiry(params.end),
+                },
+            );
+
+            (outbound_full, inbound_full)
         }
     };
-    let inbound_batches = match run_sql(&state.ctx, &inbound_sql).await {
-        Ok(b) => b,
-        Err(resp) => {
-            state.ctx.deregister_udf(&udf_name);
-            return resp;
-        }
-    };
-    state.ctx.deregister_udf(&udf_name);
 
-    let outbound = aggregate_by_asn(&outbound_batches, &state.asn_db, &exclude, params.top);
-    let inbound = aggregate_by_asn(&inbound_batches, &state.asn_db, &exclude, params.top);
+    let outbound = rank_asn_stats(&outbound_full, &exclude, params.top);
+    let inbound = rank_asn_stats(&inbound_full, &exclude, params.top);
 
     Json(json!({
         "query": {
@@ -873,7 +1005,7 @@ struct AsnPeerTimeseriesParams {
     exclude_asns: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct AsnTimeseriesPoint {
     bucket_start: String,
     asn: u32,
@@ -896,6 +1028,12 @@ struct AsnTimeseriesPoint {
 /// can pivot this directly into fixed-length per-ASN series (one point per
 /// bucket, in order) without handling gaps - the same shape the old
 /// CSV-based netflow_build_figure_csv pivoted from pandas.
+/// Same caching strategy as asn_peer_stats (see its doc comment) - the
+/// full (all ASNs, zero-filled across all buckets, no exclude/top applied)
+/// breakdown is cached in `state.peer_timeseries_cache` keyed on
+/// prefixes+time range+bucket size; `rank_asn_timeseries` (exclude + top +
+/// re-flatten in rank order) runs fresh every request over either the
+/// cached or freshly-queried full data.
 async fn asn_peer_timeseries(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AsnPeerTimeseriesParams>,
@@ -915,54 +1053,81 @@ async fn asn_peer_timeseries(
     let start_ns = params.start.timestamp_nanos_opt().unwrap_or(0);
     let end_ns = params.end.timestamp_nanos_opt().unwrap_or(0);
     let bucket_ns = params.bucket_secs.max(1) * 1_000_000_000;
-    let day_filter = day_partition_filter(params.start, params.end);
+    let key = cache_key(&prefixes, start_ns, end_ns, Some(params.bucket_secs));
 
-    let udf_id = state.next_udf_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let udf_name = format!("cidr_match_{udf_id}");
-    let ranges = Arc::new(PrefixRanges::new(&prefixes));
-    state.ctx.register_udf(ScalarUDF::from(CidrMatchUdf {
-        name: udf_name.clone(),
-        signature: Signature::any(1, Volatility::Immutable),
-        ranges,
-    }));
+    let cached = {
+        let guard = state.peer_timeseries_cache.lock().unwrap();
+        guard.get(&key).filter(|e| e.is_fresh()).map(|e| (e.outbound.clone(), e.inbound.clone()))
+    };
 
-    let outbound_sql = format!(
-        "SELECT (time_flow_start_ns / {bucket_ns}) * {bucket_ns} AS bucket_start_ns, \
-                dst_addr AS addr, SUM(bytes) AS total_bytes, SUM(packets) AS total_packets, COUNT(*) AS flow_count \
-         FROM {FLOWS_TABLE} \
-         WHERE time_flow_start_ns <= {end_ns} AND time_flow_start_ns >= {start_ns} \
-           AND ({day_filter}) \
-           AND {udf_name}(src_addr) \
-         GROUP BY bucket_start_ns, dst_addr"
-    );
-    let inbound_sql = format!(
-        "SELECT (time_flow_start_ns / {bucket_ns}) * {bucket_ns} AS bucket_start_ns, \
-                src_addr AS addr, SUM(bytes) AS total_bytes, SUM(packets) AS total_packets, COUNT(*) AS flow_count \
-         FROM {FLOWS_TABLE} \
-         WHERE time_flow_start_ns <= {end_ns} AND time_flow_start_ns >= {start_ns} \
-           AND ({day_filter}) \
-           AND {udf_name}(dst_addr) \
-         GROUP BY bucket_start_ns, src_addr"
-    );
+    let (outbound_full, inbound_full) = match cached {
+        Some(full) => full,
+        None => {
+            let day_filter = day_partition_filter(params.start, params.end);
 
-    let outbound_batches = match run_sql(&state.ctx, &outbound_sql).await {
-        Ok(b) => b,
-        Err(resp) => {
+            let udf_id = state.next_udf_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let udf_name = format!("cidr_match_{udf_id}");
+            let ranges = Arc::new(PrefixRanges::new(&prefixes));
+            state.ctx.register_udf(ScalarUDF::from(CidrMatchUdf {
+                name: udf_name.clone(),
+                signature: Signature::any(1, Volatility::Immutable),
+                ranges,
+            }));
+
+            let outbound_sql = format!(
+                "SELECT (time_flow_start_ns / {bucket_ns}) * {bucket_ns} AS bucket_start_ns, \
+                        dst_addr AS addr, SUM(bytes) AS total_bytes, SUM(packets) AS total_packets, COUNT(*) AS flow_count \
+                 FROM {FLOWS_TABLE} \
+                 WHERE time_flow_start_ns <= {end_ns} AND time_flow_start_ns >= {start_ns} \
+                   AND ({day_filter}) \
+                   AND {udf_name}(src_addr) \
+                 GROUP BY bucket_start_ns, dst_addr"
+            );
+            let inbound_sql = format!(
+                "SELECT (time_flow_start_ns / {bucket_ns}) * {bucket_ns} AS bucket_start_ns, \
+                        src_addr AS addr, SUM(bytes) AS total_bytes, SUM(packets) AS total_packets, COUNT(*) AS flow_count \
+                 FROM {FLOWS_TABLE} \
+                 WHERE time_flow_start_ns <= {end_ns} AND time_flow_start_ns >= {start_ns} \
+                   AND ({day_filter}) \
+                   AND {udf_name}(dst_addr) \
+                 GROUP BY bucket_start_ns, src_addr"
+            );
+
+            let outbound_batches = match run_sql(&state.ctx, &outbound_sql).await {
+                Ok(b) => b,
+                Err(resp) => {
+                    state.ctx.deregister_udf(&udf_name);
+                    return resp;
+                }
+            };
+            let inbound_batches = match run_sql(&state.ctx, &inbound_sql).await {
+                Ok(b) => b,
+                Err(resp) => {
+                    state.ctx.deregister_udf(&udf_name);
+                    return resp;
+                }
+            };
             state.ctx.deregister_udf(&udf_name);
-            return resp;
+
+            let outbound_full = aggregate_by_asn_timeseries_full(&outbound_batches, &state.asn_db);
+            let inbound_full = aggregate_by_asn_timeseries_full(&inbound_batches, &state.asn_db);
+
+            cache_insert(
+                &state.peer_timeseries_cache,
+                key,
+                CacheEntry {
+                    outbound: outbound_full.clone(),
+                    inbound: inbound_full.clone(),
+                    expires_at: cache_expiry(params.end),
+                },
+            );
+
+            (outbound_full, inbound_full)
         }
     };
-    let inbound_batches = match run_sql(&state.ctx, &inbound_sql).await {
-        Ok(b) => b,
-        Err(resp) => {
-            state.ctx.deregister_udf(&udf_name);
-            return resp;
-        }
-    };
-    state.ctx.deregister_udf(&udf_name);
 
-    let outbound = aggregate_by_asn_timeseries(&outbound_batches, &state.asn_db, &exclude, params.top);
-    let inbound = aggregate_by_asn_timeseries(&inbound_batches, &state.asn_db, &exclude, params.top);
+    let outbound = rank_asn_timeseries(&outbound_full, &exclude, params.top);
+    let inbound = rank_asn_timeseries(&inbound_full, &exclude, params.top);
 
     Json(json!({
         "query": {
@@ -979,20 +1144,18 @@ async fn asn_peer_timeseries(
     .into_response()
 }
 
-/// Same per-row (addr -> ASN, excluding `exclude`) resolution as
-/// aggregate_by_asn, but keyed by (asn, bucket) instead of just asn - see
-/// asn_peer_timeseries' doc comment for the ranking/zero-fill behavior.
-fn aggregate_by_asn_timeseries(
+/// Same per-row (addr -> ASN) resolution as aggregate_by_asn_full, but
+/// keyed by (asn, bucket) instead of just asn, and zero-filled across
+/// every distinct bucket seen for every ASN (not just the top-N ones -
+/// that filtering happens in `rank_asn_timeseries`, kept separate for the
+/// same cacheability reason `aggregate_by_asn_full`/`rank_asn_stats` are).
+fn aggregate_by_asn_timeseries_full(
     batches: &[datafusion::arrow::record_batch::RecordBatch],
     asn_db: &AsnDb,
-    exclude: &std::collections::HashSet<u32>,
-    top: usize,
 ) -> Vec<AsnTimeseriesPoint> {
     use datafusion::arrow::array::*;
 
-    // asn -> (org, country, running total bytes across all buckets - used
-    // only to pick the top N, bucket_ns -> (bytes, packets, flows))
-    let mut per_asn: HashMap<u32, (String, String, i64, HashMap<i64, (i64, i64, i64)>)> = HashMap::new();
+    let mut per_asn: HashMap<u32, (String, String, HashMap<i64, (i64, i64, i64)>)> = HashMap::new();
     let mut bucket_set: Vec<i64> = Vec::new();
 
     for batch in batches {
@@ -1006,9 +1169,6 @@ fn aggregate_by_asn_timeseries(
             let Some(raw) = addr.and_then(|a| binary_at(a, i)) else { continue };
             let Some(ip) = bytes_to_ip(&raw) else { continue };
             let Some(info) = asn_db.lookup(ip) else { continue };
-            if exclude.contains(&info.asn) {
-                continue;
-            }
             let Some(bucket_ns) = bucket_col.map(|a| a.value(i)) else { continue };
             let bytes = total_bytes.map(|a| a.value(i)).unwrap_or(0);
             let packets = total_packets.map(|a| a.value(i)).unwrap_or(0);
@@ -1016,9 +1176,8 @@ fn aggregate_by_asn_timeseries(
 
             bucket_set.push(bucket_ns);
             let entry =
-                per_asn.entry(info.asn).or_insert_with(|| (info.org.clone(), info.country.clone(), 0, HashMap::new()));
-            entry.2 += bytes;
-            let bucket_entry = entry.3.entry(bucket_ns).or_insert((0, 0, 0));
+                per_asn.entry(info.asn).or_insert_with(|| (info.org.clone(), info.country.clone(), HashMap::new()));
+            let bucket_entry = entry.2.entry(bucket_ns).or_insert((0, 0, 0));
             bucket_entry.0 += bytes;
             bucket_entry.1 += packets;
             bucket_entry.2 += flows;
@@ -1028,12 +1187,8 @@ fn aggregate_by_asn_timeseries(
     bucket_set.sort_unstable();
     bucket_set.dedup();
 
-    let mut ranked: Vec<_> = per_asn.into_iter().collect();
-    ranked.sort_by_key(|(_, (_, _, total, _))| std::cmp::Reverse(*total));
-    ranked.truncate(top);
-
-    let mut points = Vec::with_capacity(ranked.len() * bucket_set.len());
-    for (asn, (org, country, _total, buckets)) in &ranked {
+    let mut points = Vec::new();
+    for (asn, (org, country, buckets)) in &per_asn {
         for &bucket_ns in &bucket_set {
             let (bytes, packets, flows) = buckets.get(&bucket_ns).copied().unwrap_or((0, 0, 0));
             let bucket_start = DateTime::<Utc>::from_timestamp(bucket_ns / 1_000_000_000, (bucket_ns % 1_000_000_000) as u32)
@@ -1051,6 +1206,35 @@ fn aggregate_by_asn_timeseries(
         }
     }
     points
+}
+
+/// Drop excluded ASNs, rank the rest by total bytes across all buckets,
+/// and keep the top N - the cheap, always-fresh-per-request step over
+/// `aggregate_by_asn_timeseries_full`'s (possibly cached) output. Each
+/// selected ASN's points are emitted together, in their original
+/// (bucket-ordered) relative order, ranked ASN first.
+fn rank_asn_timeseries(
+    full: &[AsnTimeseriesPoint],
+    exclude: &std::collections::HashSet<u32>,
+    top: usize,
+) -> Vec<AsnTimeseriesPoint> {
+    let mut totals: HashMap<u32, i64> = HashMap::new();
+    for p in full {
+        if exclude.contains(&p.asn) {
+            continue;
+        }
+        *totals.entry(p.asn).or_insert(0) += p.total_bytes;
+    }
+
+    let mut ranked_asns: Vec<(u32, i64)> = totals.into_iter().collect();
+    ranked_asns.sort_by_key(|&(_, total)| std::cmp::Reverse(total));
+    ranked_asns.truncate(top);
+
+    let mut result = Vec::new();
+    for (asn, _) in &ranked_asns {
+        result.extend(full.iter().filter(|p| p.asn == *asn).cloned());
+    }
+    result
 }
 
 fn bytes_to_ip(bytes: &[u8]) -> Option<IpAddr> {
