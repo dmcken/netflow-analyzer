@@ -238,10 +238,19 @@ are excluded or how many rows it wants is still a cache hit against the
 same underlying data instead of forcing a new multi-minute query.
 
 Freshness follows from whether the requested window is still open: if
-`end` is more than 10 minutes in the past (`WINDOW_CLOSED_MARGIN` -
-comfortably past parquet-datalake's ~5-minute flush window), the window
-is treated as immutable and cached forever; otherwise it gets a 5-minute
-TTL (`OPEN_WINDOW_CACHE_TTL`), since flows are still arriving for it.
+`end` is more than 45 minutes in the past (`WINDOW_CLOSED_MARGIN`), the
+window is treated as immutable and cached forever; otherwise it gets a
+5-minute TTL (`OPEN_WINDOW_CACHE_TTL`), since flows are still arriving
+for it. 45 minutes, not the ~5-minute file-creation cadence it was first
+(incorrectly) set to: measured across a full day's files, each file's own
+internal `time_flow_start_ns` span is consistently ~35 minutes, not 5 -
+routers/exporters re-report long-lived flows periodically while keeping
+their *original* start time, so a record written just now can carry a
+timestamp up to ~35 minutes old. The first (10-minute) margin marked
+windows closed up to ~25 minutes before they were actually done
+accumulating data, which is a correctness bug, not just a staleness one -
+a cache entry frozen as "closed" never re-queries, so it silently
+undercounts that window forever rather than catching up next TTL cycle.
 Cache lives in-memory only (`AppState.peer_stats_cache` /
 `peer_timeseries_cache`, plain `Mutex<HashMap<...>>`) - empties on every
 restart, no persistence to disk. A crude size cap
